@@ -28,11 +28,23 @@ DATA_DIR <- if (IS_SHINYLIVE) "data" else "../data"
 #
 # IMPORTANT: github.com/<owner>/<repo>/releases/latest/download/<file> is NOT
 # directly fetchable from a browser page (302 redirect + no CORS headers on
-# the asset CDN). Point this at a CORS-enabled endpoint serving the same
-# files. Recommended: a free Cloudflare Worker proxy in front of the release
-# (see worker.js / GITHUB_PAGES.md in this repo), e.g.
-#   PARQUET_BASE_URL <- "https://my-proxy.my-subdomain.workers.dev/https://github.com/OWNER/REPO/releases/latest/download"
-# Local dev ignores this entirely and reads DATA_DIR from disk.
+# the asset CDN), so requests go through a CORS proxy. Current setup: Corsfix.
+#
+# Corsfix production checklist (requests will FAIL with a tiny error body
+# until these are done):
+#   1. Add your Pages origin (e.g. "jacobmgreer.github.io") in the Corsfix
+#      dashboard domain whitelist — localhost works free without setup, but
+#      deployed origins must be registered (or use an API key, see below).
+#   2. Public/open-source projects can apply for Corsfix's OSS sponsorship
+#      instead of a paid plan.
+#   3. Mind the proxy's 20 s response timeout — very large/slow downloads
+#      return 504.
+#
+# If you use an API key instead of domain whitelisting, pass it via headers:
+#   NITRATE_PARQUET_HEADERS="x-corsfix-key: cfx_your_key_here"
+# (a client-side key is public by nature — prefer domain whitelisting.)
+#
+# Local dev ignores all of this entirely and reads DATA_DIR from disk.
 PARQUET_BASE_URL <- Sys.getenv(
   "NITRATE_PARQUET_BASE_URL",
   "https://proxy.corsfix.com/?https://github.com/jacobmgreer/in-sight/releases/latest/download"
@@ -107,30 +119,74 @@ check_files <- function() {
 # SHINYLIVE DATA FETCH — pull the release parquets into the webR filesystem
 # =============================================================================
 
-fetch_binary <- function(url, dest) {
-  # webR implements download.file(); mode = "wb" is required for parquet bytes.
+# Diagnostics from the last fetch attempt, surfaced in the UI on failure so a
+# broken download shows its real cause instead of masquerading as
+# "missing files / update DATA_DIR".
+FETCH_LOG <- character()
+log_fetch <- function(...) {
+  msg <- paste0(...)
+  FETCH_LOG[[length(FETCH_LOG) + 1]] <<- msg
+  message("[nitrate-dash] ", msg)
+}
+
+fetch_headers <- function() {
+  # Optional "Name: value" lines (one per line) for proxies needing an API key,
+  # e.g. NITRATE_PARQUET_HEADERS="x-corsfix-key: cfx_12345678"
+  h <- Sys.getenv("NITRATE_PARQUET_HEADERS", "")
+  if (!nzchar(h)) return(NULL)
+  lines <- trimws(strsplit(h, "\n")[[1]])
+  lines <- lines[nzchar(lines)]
+  if (!length(lines)) return(NULL)
+  kv <- strsplit(lines, ":", fixed = TRUE)
+  stats::setNames(
+    vapply(kv, function(x) trimws(paste(x[-1], collapse = ":")), character(1)),
+    vapply(kv, function(x) trimws(x[[1]]), character(1))
+  )
+}
+
+is_parquet_file <- function(path) {
+  if (!file.exists(path) || file.size(path) < 8) return(FALSE)
+  con <- file(path, open = "rb")
+  on.exit(close(con))
+  identical(readBin(con, "raw", 4), charToRaw("PAR1"))
+}
+
+sniff_text <- function(path, n = 200) {
+  con <- file(path, open = "rb")
+  on.exit(close(con))
+  gsub("[^[:print:]\t]", "?", rawToChar(readBin(con, "raw", n)))
+}
+
+fetch_one <- function(url, dest) {
+  args <- list(url = url, destfile = dest, mode = "wb", quiet = TRUE)
+  hdrs <- fetch_headers()
+  if (!is.null(hdrs)) args$headers <- hdrs
   tryCatch({
-    utils::download.file(url, destfile = dest, mode = "wb", quiet = TRUE)
-    file.exists(dest) && file.size(dest) > 0
+    do.call(utils::download.file, args)
+    TRUE
   }, error = function(e) {
-    message("[nitrate-dash] download.file failed: ", conditionMessage(e))
-    # Fallback: stream through url() + readBin/writeBin.
-    tryCatch({
-      src <- url(url, open = "rb")
-      on.exit(close(src), add = TRUE)
-      out <- file(dest, open = "wb")
-      on.exit(close(out), add = TRUE)
-      repeat {
-        bytes <- readBin(src, what = "raw", n = 4 * 1024 * 1024)
-        if (!length(bytes)) break
-        writeBin(bytes, out)
-      }
-      file.exists(dest) && file.size(dest) > 0
-    }, error = function(e2) {
-      message("[nitrate-dash] fallback fetch failed: ", conditionMessage(e2))
-      FALSE
-    })
+    log_fetch("fetch errored — ", url, " — ", conditionMessage(e))
+    FALSE
   })
+}
+
+fetch_binary <- function(url, dest) {
+  if (!fetch_one(url, dest)) return(FALSE)
+
+  if (!file.exists(dest) || file.size(dest) == 0) {
+    log_fetch("fetch returned no data — ", url)
+    unlink(dest)
+    return(FALSE)
+  }
+  if (!is_parquet_file(dest)) {
+    # A CORS proxy / 404 / "origin not allowed" response is usually a tiny
+    # JSON or HTML body — log its beginning so the UI can show the cause.
+    log_fetch("response was not parquet (", file.size(dest), " B) — ", url,
+              " — first bytes: ", sniff_text(dest))
+    unlink(dest)
+    return(FALSE)
+  }
+  TRUE
 }
 
 download_parquets <- function() {
@@ -139,7 +195,7 @@ download_parquets <- function() {
   for (f in c(CONTENT_PARQUET(), CREATOR_PARQUET())) {
     if (file.exists(f)) next
     src <- paste0(PARQUET_BASE_URL, "/", basename(f))
-    message("[nitrate-dash] fetching ", basename(f), " from release…")
+    log_fetch("fetching ", basename(f), "…")
     ok <- fetch_binary(src, f) && ok
   }
   ok
@@ -907,6 +963,21 @@ server <- function(input, output, session) {
         tags$strong("Loading parquet data… "), "this only happens once per visit."))
     }
     if (status == "ok") return(NULL)
+
+    if (IS_SHINYLIVE && length(FETCH_LOG) > 0) {
+      targets <- paste0(PARQUET_BASE_URL, "/", basename(c(CONTENT_PARQUET(), CREATOR_PARQUET())))
+      return(div(class = "alert alert-danger",
+        tags$strong("Parquet download failed in the browser."), tags$br(),
+        "Attempted: ", tags$ul(lapply(targets, function(u) tags$li(tags$code(u)))),
+        tags$strong("What the server said:"),
+        tags$ul(lapply(utils::tail(FETCH_LOG, 6), tags$li)),
+        tags$hr(),
+        "Most likely fixes: (1) confirm the release assets exist at that exact URL; ",
+        "(2) if using Corsfix, register this origin — ", tags$code("https://", session$clientData$url_hostname),
+        " — in the Corsfix dashboard, or set an API key via the ",
+        tags$code("NITRATE_PARQUET_HEADERS"), " env var. See GITHUB_PAGES.md."
+      ))
+    }
 
     missing <- check_files()
     div(class = "alert alert-warning",
