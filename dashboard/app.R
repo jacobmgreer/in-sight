@@ -14,13 +14,32 @@ options(bslib.precompiled = TRUE)
 
 `%||%` <- function(a, b) if (is.null(a)) b else a
 
-# Mutable data location. Local dev: "data" or "../data" if run from dashboard/.
-# In Shinylive this stays "data" and the parquet files are downloaded into the
-# webR virtual filesystem at runtime from the deployed site.
-DATA_DIR <- "../data"
+# Detect the Shinylive/webR runtime. IN_SHINYLIVE is set by the shinylive
+# runtime; Emscripten is webR's sysname. A local R session hits neither.
+IS_SHINYLIVE <- nzchar(Sys.getenv("IN_SHINYLIVE")) ||
+  identical(Sys.info()[["sysname"]], "Emscripten")
 
-CONTENT_PARQUET <- function() file.path(DATA_DIR, "big_sound_content.parquet")
-CREATOR_PARQUET <- function() file.path(DATA_DIR, "big_sound_creator.parquet")
+# Mutable data location. Local dev: "data" (repo root) or "../data" (dashboard/).
+# In Shinylive the app folder is the working directory, so keep it relative;
+# the parquets are downloaded into the webR virtual filesystem at runtime.
+DATA_DIR <- if (IS_SHINYLIVE) "data" else "../data"
+
+# Where the Shinylive build fetches the two parquets.
+#
+# IMPORTANT: github.com/<owner>/<repo>/releases/latest/download/<file> is NOT
+# directly fetchable from a browser page (302 redirect + no CORS headers on
+# the asset CDN). Point this at a CORS-enabled endpoint serving the same
+# files. Recommended: a free Cloudflare Worker proxy in front of the release
+# (see worker.js / GITHUB_PAGES.md in this repo), e.g.
+#   PARQUET_BASE_URL <- "https://my-proxy.my-subdomain.workers.dev/https://github.com/OWNER/REPO/releases/latest/download"
+# Local dev ignores this entirely and reads DATA_DIR from disk.
+PARQUET_BASE_URL <- Sys.getenv(
+  "NITRATE_PARQUET_BASE_URL",
+  "https://proxy.corsfix.com/?https://github.com/jacobmgreer/in-sight/releases/latest/download"
+)
+
+CONTENT_PARQUET <- function() file.path(DATA_DIR, "big_sight_content.parquet")
+CREATOR_PARQUET <- function() file.path(DATA_DIR, "big_sight_creator.parquet")
 FILTER_DEBOUNCE_MS <- 400
 
 MACRO_DIR <- "macros"
@@ -55,7 +74,9 @@ sql_in     <- function(v) paste0("(", paste(sql_quote(v), collapse = ", "), ")")
 
 open_con <- function() {
   con <- dbConnect(duckdb(), dbdir = ":memory:", read_only = FALSE)
-  dbExecute(con, "PRAGMA threads=6;")
+  # DuckDB-Wasm is single-threaded by default (multithreading needs COOP/CEOP
+  # headers, which GitHub Pages does not send), so only set this natively.
+  if (!IS_SHINYLIVE) dbExecute(con, "PRAGMA threads=6;")
   dbExecute(con, "SET preserve_insertion_order = false;")
   con
 }
@@ -80,6 +101,48 @@ run_sql <- function(con, sql) {
 check_files <- function() {
   files <- c(CONTENT_PARQUET(), CREATOR_PARQUET())
   basename(files[!file.exists(files)])
+}
+
+# =============================================================================
+# SHINYLIVE DATA FETCH — pull the release parquets into the webR filesystem
+# =============================================================================
+
+fetch_binary <- function(url, dest) {
+  # webR implements download.file(); mode = "wb" is required for parquet bytes.
+  tryCatch({
+    utils::download.file(url, destfile = dest, mode = "wb", quiet = TRUE)
+    file.exists(dest) && file.size(dest) > 0
+  }, error = function(e) {
+    message("[nitrate-dash] download.file failed: ", conditionMessage(e))
+    # Fallback: stream through url() + readBin/writeBin.
+    tryCatch({
+      src <- url(url, open = "rb")
+      on.exit(close(src), add = TRUE)
+      out <- file(dest, open = "wb")
+      on.exit(close(out), add = TRUE)
+      repeat {
+        bytes <- readBin(src, what = "raw", n = 4 * 1024 * 1024)
+        if (!length(bytes)) break
+        writeBin(bytes, out)
+      }
+      file.exists(dest) && file.size(dest) > 0
+    }, error = function(e2) {
+      message("[nitrate-dash] fallback fetch failed: ", conditionMessage(e2))
+      FALSE
+    })
+  })
+}
+
+download_parquets <- function() {
+  dir.create(DATA_DIR, showWarnings = FALSE, recursive = TRUE)
+  ok <- TRUE
+  for (f in c(CONTENT_PARQUET(), CREATOR_PARQUET())) {
+    if (file.exists(f)) next
+    src <- paste0(PARQUET_BASE_URL, "/", basename(f))
+    message("[nitrate-dash] fetching ", basename(f), " from release…")
+    ok <- fetch_binary(src, f) && ok
+  }
+  ok
 }
 
 pick_col <- function(cols, candidates, label) {
@@ -272,6 +335,13 @@ init_engine <- function() {
   dbExecute(con, sprintf("CREATE TABLE nc_content AS SELECT * FROM read_parquet('%s')", CONTENT_PARQUET()))
   dbExecute(con, sprintf("CREATE TABLE nc_creator AS SELECT * FROM read_parquet('%s')", CREATOR_PARQUET()))
   message("[nitrate-dash] Bitmap cache ready.")
+
+  if (IS_SHINYLIVE) {
+    # The parquet bytes are now fully materialized as DuckDB tables, so drop
+    # the raw-file copies from the webR virtual filesystem to free memory
+    # (DuckDB-Wasm is capped around 4 GB total).
+    unlink(c(CONTENT_PARQUET(), CREATOR_PARQUET()))
+  }
 
   NC_CON <<- con
   invisible(TRUE)
@@ -783,22 +853,14 @@ server <- function(input, output, session) {
   # One-time startup: ensure parquet files exist (downloading them from the
   # deployed site when running under Shinylive/webR), then build the engine.
   observe({
-    if (length(check_files()) > 0) {
-      # Files are not on the local/virtual filesystem. Build an absolute base
-      # URL for this deployment from the browser's own location — works for
-      # user/org pages (pathname "/") and project pages (pathname "/repo/").
-      base_url <- paste0(
-        session$clientData$url_protocol, "//",
-        session$clientData$url_host,
-        session$clientData$url_pathname
+    if (length(check_files()) > 0 && IS_SHINYLIVE) {
+      # Files are not in the webR virtual filesystem yet; pull them from the
+      # release via PARQUET_BASE_URL, then fall through to engine init below.
+      message("[nitrate-dash] parquet files not found locally; fetching from release")
+      tryCatch(
+        download_parquets(),
+        error = function(e) message("[nitrate-dash] fetch error: ", conditionMessage(e))
       )
-      if (!endsWith(base_url, "/")) base_url <- paste0(base_url, "/")
-
-      # message("[nitrate-dash] parquet files not found locally; fetching from ", base_url)
-      # tryCatch(
-      #   download_parquets_from_manifest(base_url),
-      #   error = function(e) message("[nitrate-dash] fetch error: ", conditionMessage(e))
-      # )
     }
 
     if (length(check_files()) == 0) {
