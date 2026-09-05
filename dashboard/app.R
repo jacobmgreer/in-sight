@@ -43,7 +43,7 @@ PARQUET_FILES <- function() {
 # DEFAULT: same-origin. When the parquets are deployed next to the Shinylive
 # OVERRIDE: set NITRATE_PARQUET_BASE
 # Local dev ignores all of this entirely and reads DATA_DIR from disk.
-PARQUET_BASE_URL_ENV <- "https://jacobmgreer.github.io/in-sight"
+# PARQUET_BASE_URL_ENV <- "https://jacobmgreer.github.io/in-sight"
 
 TYPE_CONTENT <- 1L
 TYPE_CREATOR <- 2L
