@@ -1,0 +1,10 @@
+big_sight_6.parquet
+big_sight_9.parquet
+big_sight_1.parquet
+big_sight_8.parquet
+big_sight_5.parquet
+big_sight_0.parquet
+big_sight_7.parquet
+big_sight_4.parquet
+big_sight_3.parquet
+big_sight_2.parquet
