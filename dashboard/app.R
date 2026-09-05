@@ -41,19 +41,9 @@ PARQUET_FILES <- function() {
 # Where Shinylive fetches the 10 shards.
 #
 # DEFAULT: same-origin. When the parquets are deployed next to the Shinylive
-# app on GitHub Pages (e.g. <repo>/data/big_sight_N.parquet), the fetch is
-# same-origin and needs NO CORS proxy — parquet_base_url() derives the URL
-# from the page's own location at runtime, so subpath hosting just works.
-#
-# OVERRIDE: set NITRATE_PARQUET_BASE_URL to an absolute URL if the parquets
-# live elsewhere (e.g. another site or a release-asset proxy). If that origin
-# doesn't send CORS headers you'll need a proxy, e.g.:
-#   NITRATE_PARQUET_BASE_URL="https://everyorigin.jwvbremen.nl/get?url=https://github.com/<owner>/<repo>/releases/latest/download"
-# Proxies needing an API key can pass headers via NITRATE_PARQUET_HEADERS
-# (one "Name: value" per line).
-#
+# OVERRIDE: set NITRATE_PARQUET_BASE
 # Local dev ignores all of this entirely and reads DATA_DIR from disk.
-PARQUET_BASE_URL_ENV <- "NITRATE_PARQUET_BASE_URL"
+PARQUET_BASE_URL_ENV <- "https://jacobmgreer.github.io/in-sight"
 
 TYPE_CONTENT <- 1L
 TYPE_CREATOR <- 2L
