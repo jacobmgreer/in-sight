@@ -47,7 +47,7 @@ DATA_DIR <- if (IS_SHINYLIVE) "data" else "../data"
 # Local dev ignores all of this entirely and reads DATA_DIR from disk.
 PARQUET_BASE_URL <- Sys.getenv(
   "NITRATE_PARQUET_BASE_URL",
-  "https://proxy.corsfix.com/?https://github.com/jacobmgreer/in-sight/releases/latest/download"
+  "https://everyorigin.jwvbremen.nl/get?url=https://github.com/jacobmgreer/in-sight/releases/latest/download"
 )
 
 CONTENT_PARQUET <- function() file.path(DATA_DIR, "big_sight_content.parquet")
